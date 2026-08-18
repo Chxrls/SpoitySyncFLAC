@@ -1,0 +1,408 @@
+import { useEffect, useRef, useState } from "react";
+import { t, translateMessage } from "@/i18n";
+import { fetchSpotifyMetadata } from "@/lib/api";
+import { toastWithSound as toast } from "@/lib/toast-with-sound";
+import { logger } from "@/lib/logger";
+import { AddFetchHistory, SearchSpotifyByType } from "../../wailsjs/go/main/App";
+import { EventsOff, EventsOn } from "../../wailsjs/runtime/runtime";
+import type { SpotifyMetadataResponse } from "@/types/api";
+export function useMetadata() {
+    const [loading, setLoading] = useState(false);
+    const [metadata, setMetadata] = useState<SpotifyMetadataResponse | null>(null);
+    const navigationHistory = useRef<Array<{
+        url: string;
+        metadata: SpotifyMetadataResponse | null;
+    }>>([{ url: "", metadata: null }]);
+    const navigationIndex = useRef(0);
+    const [navigationState, setNavigationState] = useState({ canGoBack: false, canGoForward: false, currentUrl: "" });
+    const [showVpnAdviceDialog, setShowVpnAdviceDialog] = useState(false);
+    const [fetchFailureReason, setFetchFailureReason] = useState("");
+    const loadingToastId = useRef<string | number | null>(null);
+    const fetchedCount = useRef(0);
+    const currentName = useRef("");
+    const updateNavigationState = () => {
+        setNavigationState({
+            canGoBack: navigationIndex.current > 0,
+            canGoForward: navigationIndex.current < navigationHistory.current.length - 1,
+            currentUrl: navigationHistory.current[navigationIndex.current]?.url || "",
+        });
+    };
+    const rememberOrigin = (url?: string) => {
+        if (url !== undefined) {
+            navigationHistory.current[navigationIndex.current] = { ...navigationHistory.current[navigationIndex.current], url };
+        }
+    };
+    const commitNavigation = (url: string, data: SpotifyMetadataResponse) => {
+        navigationHistory.current = [...navigationHistory.current.slice(0, navigationIndex.current + 1), { url, metadata: data }];
+        navigationIndex.current += 1;
+        setMetadata(data);
+        updateNavigationState();
+    };
+    const moveNavigation = (offset: -1 | 1) => {
+        const nextIndex = navigationIndex.current + offset;
+        if (nextIndex < 0 || nextIndex >= navigationHistory.current.length)
+            return null;
+        navigationIndex.current = nextIndex;
+        const entry = navigationHistory.current[nextIndex];
+        setMetadata(entry.metadata);
+        updateNavigationState();
+        return entry.url;
+    };
+    const [showAlbumDialog, setShowAlbumDialog] = useState(false);
+    const [selectedAlbum, setSelectedAlbum] = useState<{
+        id: string;
+        name: string;
+        external_urls: string;
+    } | null>(null);
+    const [pendingArtistName, setPendingArtistName] = useState<string | null>(null);
+    const showFetchFailureAdvice = (errorMsg: string) => {
+        setFetchFailureReason(errorMsg);
+        setShowVpnAdviceDialog(true);
+    };
+    const resolveArtistUrlBySearch = async (artistName: string): Promise<string | null> => {
+        const query = artistName.trim();
+        if (!query) {
+            return null;
+        }
+        const results = await SearchSpotifyByType({
+            query,
+            search_type: "artist",
+            limit: 10,
+            offset: 0,
+        });
+        const normalizedQuery = query.toLocaleLowerCase();
+        const exactMatches = results.filter((result) => result.name.trim().toLocaleLowerCase() === normalizedQuery);
+        return exactMatches.length === 1 ? exactMatches[0]?.external_urls || null : null;
+    };
+    useEffect(() => {
+        if (loading) {
+            fetchedCount.current = 0;
+            currentName.current = "";
+            loadingToastId.current = toast.silentInfo(t("translation.download.fetchingMetadata"), {
+                duration: Infinity,
+                description: t("translation.download.pleaseWaitWhileWeRetrieve")
+            });
+            return;
+        }
+        if (loadingToastId.current) {
+            toast.dismiss(loadingToastId.current);
+            loadingToastId.current = null;
+        }
+    }, [loading]);
+    useEffect(() => {
+        const handler = (data: any) => {
+            if (!data) {
+                return;
+            }
+            if (Array.isArray(data)) {
+                fetchedCount.current += data.length;
+                if (loadingToastId.current && currentName.current) {
+                    toast.silentInfo(t("translation.migrated.useMetadata.fetchingTracksFor", { value1: currentName.current.toLowerCase() }), {
+                        id: loadingToastId.current,
+                        description: t("translation.metadata.fetched", { count: fetchedCount.current, formattedCount: fetchedCount.current.toLocaleString() })
+                    });
+                }
+            }
+            else {
+                const baseInfo = data;
+                const name = "artist_info" in baseInfo ? baseInfo.artist_info.name :
+                    "album_info" in baseInfo ? baseInfo.album_info.name :
+                        "playlist_info" in baseInfo ? (baseInfo.playlist_info.name || baseInfo.playlist_info.owner.name) : "";
+                if (name) {
+                    currentName.current = name;
+                    if (loadingToastId.current) {
+                        toast.silentInfo(t("translation.migrated.useMetadata.fetchingTracksFor", { value1: name.toLowerCase() }), {
+                            id: loadingToastId.current,
+                            description: t("translation.metadata.fetched", { count: fetchedCount.current, formattedCount: fetchedCount.current.toLocaleString() })
+                        });
+                    }
+                }
+            }
+            setMetadata(prev => {
+                if (Array.isArray(data)) {
+                    if (!prev || !("track_list" in prev)) {
+                        return prev;
+                    }
+                    return {
+                        ...prev,
+                        track_list: [...prev.track_list, ...data]
+                    };
+                }
+                if (prev && "track_list" in prev && prev.track_list.length > 0) {
+                    return prev;
+                }
+                const baseInfo = data;
+                if (!("track_list" in baseInfo)) {
+                    baseInfo.track_list = [];
+                }
+                return baseInfo;
+            });
+        };
+        EventsOn("metadata-stream", handler);
+        return () => EventsOff("metadata-stream");
+    }, []);
+    const getUrlType = (url: string): string => {
+        if (url.includes("/track/"))
+            return "track";
+        if (url.includes("/album/"))
+            return "album";
+        if (url.includes("/playlist/"))
+            return "playlist";
+        if (url.includes("/artist/"))
+            return "artist";
+        return "unknown";
+    };
+    const saveToHistory = async (url: string, data: SpotifyMetadataResponse) => {
+        try {
+            let name = "";
+            let info = "";
+            let image = "";
+            let type = "unknown";
+            if ("track" in data) {
+                type = "track";
+                name = data.track.name;
+                info = data.track.artists;
+                image = (data.track.images && data.track.images.length > 0) ? data.track.images : "";
+            }
+            else if ("album_info" in data) {
+                type = "album";
+                name = data.album_info.name;
+                info = `${data.track_list.length} tracks`;
+                image = data.album_info.images;
+            }
+            else if ("playlist_info" in data) {
+                type = "playlist";
+                if (data.playlist_info.name) {
+                    name = data.playlist_info.name;
+                }
+                else if (data.playlist_info.owner.name) {
+                    name = data.playlist_info.owner.name;
+                }
+                info = `${data.playlist_info.tracks.total} tracks`;
+                image = data.playlist_info.cover || "";
+            }
+            else if ("artist_info" in data) {
+                type = "artist";
+                name = data.artist_info.name;
+                info = `${data.artist_info.total_albums || data.album_list.length} albums`;
+                image = data.artist_info.images;
+            }
+            const jsonStr = JSON.stringify(data);
+            await AddFetchHistory({
+                id: crypto.randomUUID(),
+                url: url,
+                type: type,
+                name: name,
+                info: info,
+                image: image,
+                data: jsonStr,
+                is_explicit: ("track" in data && Boolean(data.track.is_explicit)) || ("album_info" in data && Boolean(data.album_info.is_explicit)),
+                timestamp: Math.floor(Date.now() / 1000)
+            });
+        }
+        catch (err) {
+            console.error("Failed to save fetch history:", err);
+        }
+    };
+    const fetchMetadataDirectly = async (url: string, originUrl?: string) => {
+        rememberOrigin(originUrl);
+        const urlType = getUrlType(url);
+        logger.info(`fetching ${urlType} metadata...`);
+        logger.debug(`url: ${url}`);
+        setLoading(true);
+        setMetadata(null);
+        try {
+            const startTime = Date.now();
+            const timeout = urlType === "artist" ? 60 : 300;
+            const data = await fetchSpotifyMetadata(url, true, 1.0, timeout);
+            const elapsed = ((Date.now() - startTime) / 1000).toFixed(2);
+            if ("playlist_info" in data) {
+                const playlistInfo = data.playlist_info;
+                if (!playlistInfo.owner.name && playlistInfo.tracks.total === 0 && data.track_list.length === 0) {
+                    logger.warning("playlist appears to be empty or private");
+                    toast.error(t("translation.download.playlistNotFoundMayBe"));
+                    setMetadata(null);
+                    return;
+                }
+            }
+            else if ("album_info" in data) {
+                const albumInfo = data.album_info;
+                if (!albumInfo.name && albumInfo.total_tracks === 0 && data.track_list.length === 0) {
+                    logger.warning("album appears to be empty or not found");
+                    toast.error(t("translation.download.albumNotFoundMayBe"));
+                    setMetadata(null);
+                    return;
+                }
+            }
+            commitNavigation(url, data);
+            saveToHistory(url, data);
+            if ("track" in data) {
+                logger.success(`fetched track: ${data.track.name} - ${data.track.artists}`);
+                logger.debug(`duration: ${data.track.duration_ms}ms`);
+            }
+            else if ("album_info" in data) {
+                logger.success(`fetched album: ${data.album_info.name}`);
+                logger.debug(`${data.track_list.length} tracks, released: ${data.album_info.release_date}`);
+            }
+            else if ("playlist_info" in data) {
+                logger.success(`fetched playlist: ${data.track_list.length} tracks`);
+                logger.debug(`by ${data.playlist_info.owner.display_name || data.playlist_info.owner.name}`);
+            }
+            else if ("artist_info" in data) {
+                logger.success(`fetched artist: ${data.artist_info.name}`);
+                logger.debug(`${data.album_list.length} albums, ${data.track_list.length} tracks`);
+            }
+            logger.info(`fetch completed in ${elapsed}s`);
+            toast.success(t("translation.download.metadataFetchedSuccessfully"));
+        }
+        catch (err) {
+            const rawError = err instanceof Error ? err.message : t("translation.app.fetchFailed");
+            const errorMsg = translateMessage(rawError);
+            logger.error(`fetch failed: ${errorMsg}`);
+            toast.error(errorMsg);
+            showFetchFailureAdvice(rawError);
+        }
+        finally {
+            setLoading(false);
+        }
+    };
+    const loadFromCache = (cachedData: string, url = "", originUrl?: string) => {
+        try {
+            const data = JSON.parse(cachedData);
+            rememberOrigin(originUrl);
+            commitNavigation(url, data);
+            toast.success(t("translation.download.loadedCache"));
+        }
+        catch (err) {
+            console.error("Failed to load from cache:", err);
+            toast.error(t("translation.download.failedLoadCache"));
+        }
+    };
+    const handleFetchMetadata = async (url: string, originUrl?: string) => {
+        if (!url.trim()) {
+            logger.warning("empty url provided");
+            toast.error(t("translation.download.pleaseEnterSpotifyUrl"));
+            return;
+        }
+        let urlToFetch = url.trim();
+        const isArtistUrl = urlToFetch.includes("/artist/");
+        if (isArtistUrl && !urlToFetch.includes("/discography")) {
+            urlToFetch = urlToFetch.replace(/\/$/, "") + "/discography/all";
+            logger.debug("converted to discography url");
+        }
+        if (isArtistUrl) {
+            logger.info("artist url detected");
+            setPendingArtistName(null);
+            await fetchMetadataDirectly(urlToFetch, originUrl);
+        }
+        else {
+            await fetchMetadataDirectly(urlToFetch, originUrl);
+        }
+        return urlToFetch;
+    };
+    const handleAlbumClick = (album: {
+        id: string;
+        name: string;
+        external_urls: string;
+    }) => {
+        logger.debug(`album clicked: ${album.name}`);
+        setSelectedAlbum(album);
+        setShowAlbumDialog(true);
+    };
+    const handleArtistClick = async (artist: {
+        id: string;
+        name: string;
+        external_urls: string;
+    }, originUrl?: string) => {
+        logger.debug(`artist clicked: ${artist.name}`);
+        const artistID = artist.id.trim();
+        const artistUrlFromID = /^[a-zA-Z0-9]{22}$/.test(artistID)
+            ? `https://open.spotify.com/artist/${artistID}`
+            : "";
+        const resolvedArtistUrl = artist.external_urls.trim() || artistUrlFromID || (await resolveArtistUrlBySearch(artist.name)) || "";
+        if (!resolvedArtistUrl) {
+            toast.error(t("translation.migrated.useMetadata.artistNotFound", { value1: artist.name }));
+            return "";
+        }
+        const artistUrl = resolvedArtistUrl.includes("/discography")
+            ? resolvedArtistUrl
+            : resolvedArtistUrl.replace(/\/$/, "") + "/discography/all";
+        setPendingArtistName(artist.name);
+        await fetchMetadataDirectly(artistUrl, originUrl);
+        return resolvedArtistUrl;
+    };
+    const handleConfirmAlbumFetch = async (originUrl?: string) => {
+        if (!selectedAlbum)
+            return;
+        const albumUrl = selectedAlbum.external_urls;
+        logger.info(`fetching album: ${selectedAlbum.name}...`);
+        logger.debug(`url: ${albumUrl}`);
+        setShowAlbumDialog(false);
+        setLoading(true);
+        setMetadata(null);
+        try {
+            const startTime = Date.now();
+            const data = await fetchSpotifyMetadata(albumUrl);
+            const elapsed = ((Date.now() - startTime) / 1000).toFixed(2);
+            if ("album_info" in data) {
+                const albumInfo = data.album_info;
+                if (!albumInfo.name && albumInfo.total_tracks === 0 && data.track_list.length === 0) {
+                    logger.warning("album appears to be empty or not found");
+                    toast.error(t("translation.download.albumNotFoundMayBe"));
+                    setMetadata(null);
+                    setSelectedAlbum(null);
+                    return albumUrl;
+                }
+            }
+            rememberOrigin(originUrl);
+            commitNavigation(albumUrl, data);
+            saveToHistory(albumUrl, data);
+            if ("album_info" in data) {
+                logger.success(`fetched album: ${data.album_info.name}`);
+                logger.debug(`${data.track_list.length} tracks, released: ${data.album_info.release_date}`);
+            }
+            logger.info(`fetch completed in ${elapsed}s`);
+            toast.success(t("translation.download.albumMetadataFetchedSuccessfully"));
+            return albumUrl;
+        }
+        catch (err) {
+            const errorMsg = translateMessage(err instanceof Error ? err.message : t("translation.app.fetchFailed"));
+            logger.error(`fetch failed: ${errorMsg}`);
+            toast.error(errorMsg);
+            showFetchFailureAdvice(errorMsg);
+        }
+        finally {
+            setLoading(false);
+            setSelectedAlbum(null);
+        }
+    };
+    return {
+        loading,
+        metadata,
+        showVpnAdviceDialog,
+        setShowVpnAdviceDialog,
+        fetchFailureReason,
+        showAlbumDialog,
+        setShowAlbumDialog,
+        selectedAlbum,
+        pendingArtistName,
+        canGoBack: navigationState.canGoBack,
+        canGoForward: navigationState.canGoForward,
+        navigationUrl: navigationState.currentUrl,
+        goBack: () => moveNavigation(-1),
+        goForward: () => moveNavigation(1),
+        handleFetchMetadata,
+        handleAlbumClick,
+        handleConfirmAlbumFetch,
+        handleArtistClick,
+        loadFromCache,
+        resetMetadata: () => moveNavigation(-1),
+        clearMetadata: (url = "") => {
+            rememberOrigin(url);
+            navigationHistory.current = [...navigationHistory.current.slice(0, navigationIndex.current + 1), { url: "", metadata: null }];
+            navigationIndex.current += 1;
+            setMetadata(null);
+            updateNavigationState();
+        },
+    };
+}
